@@ -1,0 +1,508 @@
+<div id="app"></div>
+
+<script>
+  // Esperamos a que el DOM esté completamente cargado
+  document.addEventListener("DOMContentLoaded", () => {
+
+    // Accedemos a lit-html expuesto globalmente en window.litHtml
+    const { html, render } = window.litHtml;
+    const appContainer = document.getElementById('app');
+
+    // Estado de la aplicación: centralizamos todas las variables
+    const state = {
+      //Usuarios
+      currentUser: null,
+      usersList: [],
+      currentUser: null,
+
+      // Fichas (Archivos Físicos)
+      uploadMessage: '',
+      downloadMessage: '',
+      filesList: null,
+      
+      // Fichas (Base de Datos)
+      csvRecordMessage: '',
+      recordsList: null,
+      recordsMessage: '',
+      selectedRecord: null,
+      recordMessage: '',
+
+      // Pacientes (Base de Datos)
+      csvMessage: '',
+      patientsList: null,
+      patientsMessage: '', 
+      selectedPatient: null,
+      patientMessage: ''
+    };
+
+    // Plantilla principal
+    const template = (state) => html`
+      <div class="container pb-5">
+        <div class="row mb-4 mt-4">
+          <div class="col">
+            <label class="form-label fs-2 fw-bold">MedVault - API Test Page</label>
+            <p class="text-muted">Panel de control para pruebas de API de archivos y pacientes.</p>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="col-md-6">
+            <h4 class="mb-3 text-secondary">Gestión de Fichas Clinicas</h4>
+            
+            <div class="card shadow-sm mb-4 border-primary">
+              <div class="card-header bg-primary text-white fw-bold">1. Subir Archivo Físico (Ficha)</div>
+              <div class="card-body">
+                <div class="input-group mb-3">
+                  <input id="upload-file" type="file" class="form-control" />
+                  <button @click=${uploadPhysicalFile} class="btn btn-primary">Subir Archivo</button>
+                </div>
+                ${state.uploadMessage ? html`<div class="alert alert-info py-2 mb-0">${state.uploadMessage}</div>` : ''}
+              </div>
+            </div>
+
+            <div class="card shadow-sm mb-4 border-success">
+              <div class="card-header bg-success text-white fw-bold">2. Descargar Ficha Clinica</div>
+              <div class="card-body">
+                <div class="input-group mb-3">
+                  <input id="download-filename" type="text" placeholder="Nombre del archivo.ext" class="form-control" />
+                  <button @click=${downloadFile} class="btn btn-success">Descargar</button>
+                </div>
+                ${state.downloadMessage ? html`<div class="alert alert-info py-2 mb-0">${state.downloadMessage}</div>` : ''}
+              </div>
+            </div>
+
+            <div class="card shadow-sm mb-4 border-warning">
+              <div class="card-header bg-warning text-dark fw-bold">3. Ingresar Metadata Fichas (CSV BD)</div>
+              <div class="card-body">
+                <p class="small text-muted mb-2">Seleccione el CSV con los datos de las fichas clínicas.</p>
+                <div class="input-group mb-3">
+                  <input id="upload-csv-records" type="file" accept=".csv" class="form-control" />
+                  <button @click=${uploadCSVRecords} class="btn btn-warning fw-bold text-dark">Subir CSV Fichas</button>
+                </div>
+                ${state.csvRecordMessage ? html`<div class="alert alert-info py-2 mb-0">${state.csvRecordMessage}</div>` : ''}
+              </div>
+            </div>
+
+            <div class="card shadow-sm mb-4 border-info">
+              <div class="card-header bg-info text-white fw-bold">4. Consultar Fichas en Base de Datos</div>
+              <div class="card-body">
+                
+                <label class="form-label small fw-bold">Buscar ficha por Doc ID</label>
+                <div class="input-group mb-2">
+                  <input id="record-id-input" type="text" placeholder="Ej: DOC-001" class="form-control" />
+                  <button @click=${() => showDBRecord(document.getElementById('record-id-input').value)} class="btn btn-dark">Buscar</button>
+                </div>
+                ${state.recordMessage ? html`<div class="alert alert-warning py-1 small">${state.recordMessage}</div>` : ''}
+                
+                ${state.selectedRecord 
+                  ? html`
+                      <div class="p-2 mb-3 bg-light border border-dark rounded position-relative">
+                        <button class="btn-close position-absolute top-0 end-0 m-2" style="font-size: 0.7rem;" @click=${() => {state.selectedRecord = null; update()}}></button>
+                        <span class="badge bg-dark mb-1">Detalles de la Ficha</span>
+                        <pre class="mb-0 small" style="white-space: pre-wrap;">${JSON.stringify(state.selectedRecord, null, 2)}</pre>
+                      </div>
+                    ` 
+                  : ''}
+
+                <hr class="text-muted">
+
+                <div class="d-grid mb-2">
+                  <button @click=${listDBRecords} class="btn btn-outline-info text-dark">Listar Todas las Fichas de la BD</button>
+                </div>
+                ${state.recordsMessage ? html`<div class="alert alert-info py-1 small">${state.recordsMessage}</div>` : ''}
+                
+                <div class="bg-light border rounded p-2" style="max-height: 250px; overflow-y: auto;">
+                  ${state.recordsList 
+                    ? html`
+                        <ul class="list-group list-group-flush mb-0">
+                          ${state.recordsList.map(record => html`
+                            <li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-1">
+                              <span class="small">${record.title} <br><small class="text-muted">ID: ${record.doc_id} | Paciente: ${record.patient_id}</small></span>
+                              <button class="btn btn-sm btn-info text-white py-0" style="font-size: 0.75rem;" @click=${() => showDBRecord(record.doc_id)}>Detalles</button>
+                            </li>
+                          `)}
+                        </ul>
+                      `
+                    : html`<span class="text-muted small">No hay fichas listadas en la BD.</span>`
+                  }
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="col-md-6">
+            <h4 class="mb-3 text-secondary">Gestión de Pacientes</h4>
+
+            <div class="card shadow-sm mb-4 border-warning">
+              <div class="card-header bg-warning text-dark fw-bold">5. Ingresar Pacientes (CSV BD)</div>
+              <div class="card-body">
+                <p class="small text-muted mb-2">Seleccione un archivo en formato .csv para carga masiva de pacientes.</p>
+                <div class="input-group mb-3">
+                  <input id="upload-csv" type="file" accept=".csv" class="form-control" />
+                  <button @click=${uploadPatients} class="btn btn-primary">Subir CSV Pacientes</button>
+                </div>
+                ${state.csvMessage ? html`<div class="alert alert-info py-2 mb-0">${state.csvMessage}</div>` : ''}
+              </div>
+            </div>
+
+            <div class="card shadow-sm mb-4 border-info">
+              <div class="card-header bg-info text-white fw-bold">6. Listar y Consultar Pacientes</div>
+              <div class="card-body">
+                
+                <label class="form-label small fw-bold">Buscar paciente específico</label>
+                <div class="input-group mb-2">
+                  <input id="patient-id-input" type="text" placeholder="Ingrese ID del paciente" class="form-control" />
+                  <button @click=${() => showPatient(document.getElementById('patient-id-input').value)} class="btn btn-dark">Buscar</button>
+                </div>
+                ${state.patientMessage ? html`<div class="alert alert-warning py-1 small">${state.patientMessage}</div>` : ''}
+                
+                ${state.selectedPatient 
+                  ? html`
+                      <div class="p-2 mb-3 bg-light border border-dark rounded position-relative">
+                        <button class="btn-close position-absolute top-0 end-0 m-2" style="font-size: 0.7rem;" @click=${() => {state.selectedPatient = null; update()}}></button>
+                        <span class="badge bg-dark mb-1">Detalles del Paciente</span>
+                        <pre class="mb-0 small" style="white-space: pre-wrap;">${JSON.stringify(state.selectedPatient, null, 2)}</pre>
+                      </div>
+                    ` 
+                  : ''}
+
+                <hr class="text-muted">
+
+                <label class="form-label small fw-bold">Ver todos los pacientes</label>
+                <div class="d-grid mb-2">
+                  <button @click=${listPatients} class="btn btn-outline-info text-dark">Listar Todos los Pacientes</button>
+                </div>
+                ${state.patientsMessage ? html`<div class="alert alert-info py-1 small">${state.patientsMessage}</div>` : ''}
+                
+                <div class="bg-light border rounded p-2" style="max-height: 250px; overflow-y: auto;">
+                  ${state.patientsList 
+                    ? html`
+                        <ul class="list-group list-group-flush mb-0">
+                          ${state.patientsList.map(patient => html`
+                            <li class="list-group-item bg-transparent d-flex justify-content-between align-items-center py-1">
+                              <span class="small">${patient.full_name || `Paciente ID: ${patient.patient_id}`}</span>
+                            <button class="btn btn-sm btn-info text-white py-0" style="font-size: 0.75rem;" @click=${() => showPatient(patient.patient_id)}>Ver Detalles</button>
+                            </li>
+                          `)}
+                        </ul>
+                      `
+                    : html`<span class="text-muted small">No hay pacientes listados actualmente.</span>`
+                  }
+                </div>
+              </div>
+            </div>
+          </div> </div>
+
+          
+          </div> 
+
+          <div class="container pb-5">
+            ${state.currentUser && state.currentUser.role === 'admin' 
+              ? html`
+                <div class="row mt-5"> 
+                  <div class="col-12">
+                    <h4 class="text-danger fw-bold">Panel de Control de Administración</h4>
+                    <hr class="border-danger opacity-50">
+
+                    <div class="card shadow-sm mb-4 border-danger">
+                      <div class="card-header bg-danger text-white fw-bold">7. Crear Nuevo Usuario</div>
+                      <div class="card-body">
+                        <div class="row g-2">
+                          <div class="col-md-4"><input id="new-user-id" type="text" placeholder="User ID" class="form-control form-control-sm" /></div>
+                          <div class="col-md-4"><input id="new-username" type="text" placeholder="Username" class="form-control form-control-sm" /></div>
+                          <div class="col-md-4"><input id="new-password" type="password" placeholder="Contraseña" class="form-control form-control-sm" /></div>
+                          <div class="col-md-4"><input id="new-fullname" type="text" placeholder="Nombre Completo" class="form-control form-control-sm" /></div>
+                          <div class="col-md-4"><input id="new-email" type="email" placeholder="Email" class="form-control form-control-sm" /></div>
+                          <div class="col-md-4">
+                            <select id="new-role" class="form-select form-select-sm">
+                              <option value="staff">Staff</option>
+                              <option value="doctor">Doctor</option>
+                              <option value="nurse">Nurse</option>
+                              <option value="admin">Admin</option>
+                            </select>
+                          </div>
+                          <div class="col-12 d-grid mt-3">
+                            <button @click=${createNewUser} class="btn btn-danger">Registrar Usuario</button>
+                          </div>
+                        </div>
+                        ${state.userMessage ? html`<div class="alert alert-info py-2 mt-2 mb-0 small">${state.userMessage}</div>` : ''}
+                      </div>
+                    </div>
+
+                    <div class="card shadow-sm mb-4 border-dark">
+                      <div class="card-header bg-dark text-white fw-bold">Gestión de Usuarios Existentes</div>
+                      <div class="card-body">
+                        <label class="form-label">Seleccionar usuario para ver detalles:</label>
+                        <select id="user-select" class="form-select mb-3" @focus=${listAllUsers}>
+                          <option value="">-- Seleccione un usuario (Total: ${state.usersList.length}) --</option>
+                          ${state.usersList.map(u => html`
+                            <option value="${u.user_id}">${u.full_name} (${u.username}) - Rol: ${u.role}</option>
+                          `)}
+                        </select>
+                        <div class="d-flex gap-2">
+                          <button class="btn btn-outline-dark btn-sm" @click=${listAllUsers}>Actualizar Lista</button>
+                          <button class="btn btn-danger btn-sm" @click=${deleteUser}>Eliminar Usuario</button>
+                        </div>
+                      </div>
+                    </div>
+
+                  </div>
+                </div>` 
+              : ''}
+          </div>
+        </div>
+      </div>
+
+    `;
+
+
+    //FUNCIONES HITO 1.2 (escritas/codeadas por su servidora atte: Sofi :3)
+    function update() {
+      render(template(state), appContainer);
+    }
+
+    async function checkSession() {
+      try {
+        const response = await axios.get('/api/me');
+        if (response.data.success) {
+          state.currentUser = response.data.user;
+          if (state.currentUser.role === 'admin') {
+            listAllUsers();
+          }
+        } else {
+          state.currentUser = null;
+        }
+      } catch (error) {
+        state.currentUser = null;
+      }
+      update();
+    }
+
+    async function createNewUser() { //El hito dice que solo para rol admin -Sofi
+      const userData = {
+        user_id: document.getElementById('new-user-id').value,
+        username: document.getElementById('new-username').value,
+        password: document.getElementById('new-password').value,
+        full_name: document.getElementById('new-fullname').value,
+        email: document.getElementById('new-email').value,
+        role: document.getElementById('new-role').value
+      };
+      try {
+        const response = await axios.post('/admin/users', userData);
+        state.userMessage = response.data.success ? "Usuario creado con éxito" : "Error al crear";
+      } catch (error) {
+        state.userMessage = `Error: ${error.message}`;
+      }
+      update();
+    }
+
+    async function listAllUsers() { //El hito dice que solo para rol admin -Sofi
+      try {
+        const response = await axios.get('/admin/users');
+        if (response.data.success) {
+          state.usersList = response.data.users;
+        }
+      } catch (error) {
+        console.error("Error cargando usuarios:", error);
+      }
+      update();
+    }
+
+    async function deleteUser() { //El hito dice que solo para rol admin -Sofi
+      const userId = document.getElementById('user-select').value;
+      if (!userId) {
+        alert("Por favor, seleccione un usuario de la lista.");
+        return;
+      }
+      if (!confirm(`¿Está seguro de que desea eliminar al usuario con ID ${userId}?`)) {
+        return;
+      }
+      try {
+        const response = await axios.delete(`/admin/users/${userId}`);
+        if (response.data.success) {
+          alert("Usuario eliminado correctamente");
+          listAllUsers(); // Refresca la lista automáticamente
+        }
+      } catch (error) {
+        alert(`Error al eliminar: ${error.response ? error.response.data.error : error.message}`);
+      }
+    }
+
+    // --- FUNCIONES PARA FICHAS (ARCHIVOS FÍSICOS) ---
+    async function uploadPhysicalFile() {
+      const fileInput = document.getElementById('upload-file');
+      const file = fileInput.files[0];
+      if (!file) {
+        state.uploadMessage = 'Por favor, seleccione un archivo físico.';
+        return update();
+      }
+      const formData = new FormData();
+      formData.append('file', file);
+      try {
+        const response = await axios.post('/upload', formData, {
+          headers: { 'Content-Type': 'multipart/form-data' }
+        });
+        state.uploadMessage = response.data.success ? `Éxito: Archivo subido.` : 'Error al subir el archivo.';
+      } catch (error) {
+        state.uploadMessage = `Error: ${error.response ? error.response.data.error : error.message}`;
+      }
+      update();
+    }
+
+    function downloadFile() {
+      const filename = document.getElementById('download-filename').value.trim();
+      if (!filename) {
+        state.downloadMessage = 'Ingrese el nombre del archivo a descargar.';
+        update();
+        return;
+      }
+      window.location.href = `/download/${encodeURIComponent(filename)}`;
+    }
+
+    // --- FUNCIONES PARA FICHAS (BASE DE DATOS) ---
+    async function uploadCSVRecords() {
+      const fileInput = document.getElementById('upload-csv-records');
+      const file = fileInput.files[0];
+      if (!file) {
+        state.csvRecordMessage = 'Por favor, seleccione un archivo CSV de fichas.';
+        return update();
+      }
+      const formData = new FormData();
+      formData.append('file', file);
+      try {
+        const response = await axios.post('/clinical-files/upload', formData, {
+          headers: { 'Content-Type': 'multipart/form-data' }
+        });
+        state.csvRecordMessage = response.data.success ? `Éxito: ${response.data.message}` : 'Error al procesar el CSV.';
+      } catch (error) {
+        state.csvRecordMessage = `Error: ${error.response ? error.response.data.error : error.message}`;
+      }
+      update();
+    }
+
+    async function listDBRecords() {
+      try {
+        const response = await axios.get('/clinical-files');
+        if (response.data.success) {
+          state.recordsList = response.data.records;
+          state.recordsMessage = '';
+        } else {
+          state.recordsList = [];
+          state.recordsMessage = 'No se encontraron fichas.';
+        }
+      } catch (error) {
+        state.recordsList = [];
+        state.recordsMessage = `Error de conexión: ${error.message}`;
+      }
+      update();
+    }
+
+    async function showDBRecord(id) {
+      if (!id) {
+        state.recordMessage = 'Por favor, provea un ID válido.';
+        state.selectedRecord = null;
+        return update();
+      }
+      try {
+        const response = await axios.get(`/clinical-files/${id}`);
+        if (response.data.success) {
+          state.selectedRecord = response.data.record;
+          state.recordMessage = '';
+        } else {
+          state.selectedRecord = null;
+          state.recordMessage = 'No se encontró la ficha.';
+        }
+      } catch (error) {
+        state.selectedRecord = null;
+        state.recordMessage = `Error: ${error.response ? error.response.data.error : error.message}`;
+      }
+      update();
+    }
+
+    // --- FUNCIONES PARA PACIENTES (BASE DE DATOS) ---
+    async function uploadPatients() {
+      const fileInput = document.getElementById('upload-csv');
+      const file = fileInput.files[0];
+      if (!file) {
+        state.csvMessage = 'Por favor, seleccione un archivo CSV de pacientes.';
+        return update();
+      }
+      const formData = new FormData();
+      formData.append('file', file);
+      try {
+        const response = await axios.post('/patients/upload', formData, {
+          headers: { 'Content-Type': 'multipart/form-data' }
+        });
+        state.csvMessage = response.data.success ? `Éxito: ${response.data.message}` : 'Error al subir el archivo.';
+      } catch (error) {
+        state.csvMessage = `Error: ${error.response ? error.response.data.error : error.message}`;
+      }
+      update();
+    }
+
+    async function listPatients() {
+      try {
+        const response = await axios.get('/patients');
+        if (response.data.success) {
+          state.patientsList = response.data.patients;
+          state.patientsMessage = '';
+        } else {
+          state.patientsList = [];
+          state.patientsMessage = 'No se encontraron pacientes.';
+        }
+      } catch (error) {
+        state.patientsList = [];
+        state.patientsMessage = `Error de conexión: ${error.response ? error.response.data.error : error.message}`;
+      }
+      update();
+    }
+
+    async function showPatient(id) {
+      if (!id) {
+        state.patientMessage = 'Por favor, provea un ID válido.';
+        state.selectedPatient = null;
+        return update();
+      }
+      try {
+        const response = await axios.get(`/patients/${id}`);
+        if (response.data.success) {
+          state.selectedPatient = response.data.patient;
+          state.patientMessage = '';
+        } else {
+          state.selectedPatient = null;
+          state.patientMessage = 'No se encontró el paciente.';
+        }
+      } catch (error) {
+        state.selectedPatient = null;
+        state.patientMessage = `Error al obtener paciente: ${error.response ? error.response.data.error : error.message}`;
+      }
+      update();
+    }
+
+    async function createNewUser() {
+      const userData = {
+        user_id: document.getElementById('new-user-id').value,
+        username: document.getElementById('new-username').value,
+        password: document.getElementById('new-password').value,
+        full_name: document.getElementById('new-fullname').value,
+        email: document.getElementById('new-email').value,
+        role: document.getElementById('new-role').value
+      };
+
+      try {
+        const response = await axios.post('/admin/users', userData);
+        if (response.data.success) {
+            state.userMessage = "Usuario creado con éxito";
+            document.querySelectorAll('.card-danger input').forEach(i => i.value = '');
+        }
+      } catch (error) {
+        state.userMessage = `Error: ${error.response ? error.response.data.error : error.message}`;
+      }
+      update();
+    }
+
+    // Inicializar la vista por primera vez
+    update();
+    checkSession();
+  });
+</script>

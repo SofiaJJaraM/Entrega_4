@@ -1,0 +1,87 @@
+//Inutilizada por ahora no nos alcanzo el tiempo para implementarla aún
+
+<div id="patient-container" 
+     class="container mt-4" 
+     data-patient="<%= JSON.stringify(patient) %>">
+</div>
+
+<script>
+  document.addEventListener("DOMContentLoaded", () => {
+    const { html, render } = window.litHtml;
+    const container = document.getElementById('patient-container');
+    const patientData = container.getAttribute('data-patient');
+    const patient = patientData ? JSON.parse(patientData) : null;
+
+    //recuerdos de vietnam de Paradigmas en tiempo real, ayuda -Sofi
+
+    const patientINFOlayout = () => {
+      if (!patient) {
+        return html`
+          <div class="row mt-4">
+            <div class="col-md-6">
+              <div class="alert alert-danger">El paciente no existe.</div>
+              <a href="/home" class="btn btn-secondary btn-sm">Volver a home</a> <!-- esto contará como spanglish??? que suena mas aesthetic home que inicio-Sofi -->
+            </div>
+          </div>
+        `;
+      }
+
+      return html`
+        <div class="row">
+          <div class="col-md-8 col-lg-6">
+            <div class="d-flex justify-content-between align-items-end mb-4">
+              <div>
+                <h2 class="mb-0 fw-bold">Ficha de Paciente</h2>
+                <p class="text-muted small mb-0">Gestión de expediente médico</p>
+              </div>
+              <a href="/home" class="btn btn-outline-secondary btn-sm">Volver</a>
+            </div>
+
+            <!--Acá es puro copiar, pegar y cambiar porque solo me voy a dar la lata de hacer el diseño una sola vez da lo mismo que se vea fome -Sofi -->
+
+            <div class="mb-4">
+              <h4 class="text-primary mb-1">${patient.full_name}</h4>
+              <div style="height: 2px; background-color: var(--bs-primary); width: 50px;"></div>
+            </div>
+
+            <div class="row g-4">
+              <div class="col-sm-6">
+                <label class="form-label text-uppercase sx-small fw-bold text-muted" style="font-size: 0.75rem;">RUT</label>
+                <p class="fs-5">${patient.rut}</p>
+              </div>
+              <div class="col-sm-6">
+                <label class="form-label text-uppercase sx-small fw-bold text-muted" style="font-size: 0.75rem;">Género</label>
+                <p class="fs-5">${patient.sex === 'M' ? 'Masculino' : 'Femenino'}</p>
+              </div>
+              <div class="col-sm-6">
+                <label class="form-label text-uppercase sx-small fw-bold text-muted" style="font-size: 0.75rem;">F. Nacimiento</label>
+                <p class="fs-5">${new Date(patient.birth_date).toLocaleDateString()}</p>
+              </div>
+              <div class="col-sm-6">
+                <label class="form-label text-uppercase sx-small fw-bold text-muted" style="font-size: 0.75rem;">Teléfono</label>
+                <p class="fs-5">${patient.phone || 'No registrado'}</p>
+              </div>
+              <div class="col-12">
+                <label class="form-label text-uppercase sx-small fw-bold text-muted" style="font-size: 0.75rem;">Previsión / Seguro</label>
+                <p class="fs-5">${patient.insurance}</p>
+              </div>
+              <div class="col-12">
+                <label class="form-label text-uppercase sx-small fw-bold text-muted" style="font-size: 0.75rem;">Dirección</label>
+                <p class="text-muted">${patient.address}</p>
+              </div>
+              
+              <div class="col-12 mt-4">
+                <label class="form-label fw-bold">Notas y Observaciones</label>
+                <div class="p-3 bg-light rounded border-start border-4 border-primary shadow-sm">
+                  ${patient.notes || html`<span class="text-muted italic">Sin notas registradas.</span>`}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    };
+
+    render(patientINFOlayout(), container);
+  });
+</script>

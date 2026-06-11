@@ -1,0 +1,96 @@
+<div id="login-container"></div>
+
+<script>
+  document.addEventListener("DOMContentLoaded", () => {
+    const { html, render } = window.litHtml;
+    const container = document.getElementById('login-container');
+
+    // Estado para saber en qué paso estamos
+    let currentStep = 'LOGIN'; // Puede ser 'LOGIN' o '2FA'
+    let message = '';
+
+    // Plantilla dinámica según el paso
+    const loginTemplate = () => html`
+      <div class="row">
+        <div class="col-md-3">
+          <form id="auth-form" class="mt-4">
+            <h2 class="mb-4">${currentStep === 'LOGIN' ? 'Iniciar Sesión' : 'Verificación 2FA'}</h2>
+            
+            ${currentStep === 'LOGIN' ? html`
+              <div class="mb-3">
+                <label for="username" class="form-label">Usuario:</label>
+                <input type="text" id="username" name="username" class="form-control" required />
+              </div>
+              <div class="mb-3">
+                <label for="password" class="form-label">Contraseña:</label>
+                <input type="password" id="password" name="password" class="form-control" required />
+              </div>
+            ` : html`
+              <div class="mb-3">
+                <label for="token" class="form-label">Código de 6 dígitos:</label>
+                <input type="text" id="token" name="token" class="form-control" autocomplete="off" required />
+              </div>
+            `}
+            
+            <button type="submit" class="btn btn-primary">${currentStep === 'LOGIN' ? 'Ingresar' : 'Verificar'}</button>
+            ${message ? html`<p class="text-danger mt-2">${message}</p>` : null}
+          </form>
+        </div>
+      </div>
+    `;
+
+    function updateView(newMsg = '', step = currentStep) {
+      currentStep = step;
+      message = newMsg;
+      render(loginTemplate(), container);
+    }
+
+    updateView(); // Render inicial
+
+    container.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.target;
+
+      try {
+        if (currentStep === 'LOGIN') {
+          const username = form.username.value.trim();
+          const password = form.password.value.trim();
+          
+          if (!username || !password) return updateView('Falta ingresar usuario o contraseña.');
+
+          const response = await axios.post('/login', { username, password });
+          const resultData = response.data;
+
+          if (resultData.result) {
+            if (resultData.require2FA) {
+              // Cambiamos la vista para pedir el código
+              updateView(resultData.message, '2FA');
+            } else {
+              // Login exitoso sin 2FA
+              window.location.href = '/home';
+            }
+          } else {
+            updateView('Credenciales incorrectas. Inténtalo nuevamente.');
+          }
+
+        } else if (currentStep === '2FA') {
+          const token = form.token.value.trim();
+          if (!token) return updateView('Ingresa el código.', '2FA');
+
+          // Enviamos el código al nuevo endpoint
+          const response = await axios.post('/verify-2fa', { token });
+          const resultData = response.data;
+
+          if (resultData.result) {
+            window.location.href = '/home'; // Éxito total
+          } else {
+            updateView('Código incorrecto. Intenta de nuevo.', '2FA');
+          }
+        }
+      } catch (error) {
+        let errorMsg = error.response?.data?.error || 'Error al conectarse con el servidor.';
+        updateView(errorMsg, currentStep);
+      }
+    });
+  });
+</script>
