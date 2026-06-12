@@ -11,20 +11,52 @@ const http2 = require("http2");
 const bcrypt = require('bcrypt');
 const twofactor = require('node-2fa');
 
-
 // Importar express-session y session-file-store
 const session = require("express-session");
 const FileStore = require("session-file-store")(session);
 
+// === Logging ===
+const LOG_DIR = path.join(__dirname, 'logs');
+const LOG_FILE = path.join(LOG_DIR, 'app.log');
+
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+
+function log(level, msg, meta = {}) {
+  const entry = JSON.stringify({ ts: new Date().toISOString(), level, msg, ...meta });
+  process.stdout.write(entry + '\n');
+  try { fs.appendFileSync(LOG_FILE, entry + '\n'); } catch (_) {}
+}
+
+// Capturar errores no manejados antes de que crasheen el proceso
+process.on('uncaughtException', (err) => {
+  log('FATAL', 'Excepción no capturada', { error: err.message, stack: err.stack });
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  log('FATAL', 'Promesa rechazada no manejada', { reason: String(reason) });
+});
+
 const app = express();
 app.use(express.json());
+
+// Logger de requests: registra cada petición con método, URL, status y tiempo
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    log('REQUEST', `${req.method} ${req.url}`, {
+      status: res.statusCode,
+      ms: Date.now() - start,
+      ip: req.ip || req.socket?.remoteAddress,
+    });
+  });
+  next();
+});
 
 // Configurar el motor de vistas EJS
 app.set('views', path.join(__dirname, 'views'));
 app.set('view engine', 'ejs');
-app.use(expressLayouts); // Activamos el middleware para layouts
-
-// Opcional: definir el layout por defecto (busca views/layout.ejs)
+app.use(expressLayouts);
 app.set('layout', 'layout');
 
 // Configurar Multer para manejar archivos en memoria
@@ -32,20 +64,19 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 // Configurar el almacenamiento de sesiones en el sistema de archivos
 const sessionsDir = path.join(__dirname, "sessions");
-// Asegurarse de que el directorio existe
 if (!fs.existsSync(sessionsDir)) {
   fs.mkdirSync(sessionsDir, { recursive: true });
 }
 
 app.use(session({
   store: new FileStore({ path: sessionsDir }),
-  secret: process.env.SESSIONS_SECRET, // Reemplaza con una cadena secreta segura en producción
+  secret: process.env.SESSIONS_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: { maxAge: 60 * 60 * 1000 } // Opcional: 1 hora de duración
+  cookie: { maxAge: 60 * 60 * 1000 }
 }));
 
-app.use((req, res, next) => { //Se supone que esta $#% deberia evitar el user is not defined y no lo hace aaaaaaaaaaaaa -Sofi
+app.use((req, res, next) => {
   res.locals.user = req.session.user || null;
   next();
 });
@@ -53,13 +84,11 @@ app.use((req, res, next) => { //Se supone que esta $#% deberia evitar el user is
 // Directorio local para almacenar archivos
 const FILES_DIR = path.join(__dirname, "files");
 
-// Asegurarse de que el directorio exista
 if (!fs.existsSync(FILES_DIR)) {
   fs.mkdirSync(FILES_DIR, { recursive: true });
 }
 
 // Configuración de la conexión a PostgreSQL
-// Ambiente de ejecución
 const ENV = process.env.NODE_ENV || 'development';
 
 let dbPoolOptions = {
@@ -71,42 +100,68 @@ let dbPoolOptions = {
 };
 
 if (ENV === 'production') {
+  const dbCertPath = './certs/db.crt';
+  if (!fs.existsSync(dbCertPath)) {
+    log('FATAL', 'Certificado CA de la BD no encontrado', {
+      path: dbCertPath,
+      hint: 'Coloca el certificado CA de la base de datos en certs/db.crt',
+    });
+    process.exit(1);
+  }
   try {
     dbPoolOptions.ssl = {
-      ca: fs.readFileSync("./certs/db.crt"),
+      ca: fs.readFileSync(dbCertPath),
       rejectUnauthorized: true
     };
+    log('INFO', 'SSL para PostgreSQL configurado', { cert: dbCertPath });
   } catch (err) {
-    console.error('Error reading SSL certificate:', err.message);
+    log('FATAL', 'Error leyendo certificado SSL de la BD', { error: err.message });
     process.exit(1);
   }
 }
 
-// Configuración de la conexión a PostgreSQL
 const pool = new Pool(dbPoolOptions);
 
-const isAdmin = (req, res, next) => { //verifica si el user loggeado es admin o no -Sofi 
+// Loguear errores del pool de conexiones (p.ej. BD caída en mitad de la operación)
+pool.on('error', (err) => {
+  log('ERROR', 'Error inesperado en el pool de PostgreSQL', { error: err.message });
+});
+
+// Verificar conexión a la BD al arrancar
+pool.query('SELECT 1').then(() => {
+  log('INFO', 'Conexión a PostgreSQL establecida correctamente', {
+    host: dbPoolOptions.host,
+    database: dbPoolOptions.database,
+  });
+}).catch((err) => {
+  log('ERROR', 'No se pudo conectar a PostgreSQL al arrancar', { error: err.message });
+});
+
+const isAdmin = (req, res, next) => {
   if (req.session.user && req.session.user.role === 'admin') {
     return next();
   }
+  log('WARN', 'Acceso denegado: se requiere rol admin', {
+    url: req.url,
+    user: req.session.user?.username || 'anónimo',
+  });
   res.status(403).json({ error: "Acceso denegado. Se requiere rol de administrador." });
 };
 
 
 /**
  * Endpoint para subir archivos al servidor local.
- * Guarda el archivo en ./files con su nombre original.
  */
 app.post("/upload", (req, res) => {
   upload.single("file")(req, res, async (err) => {
     if (err) return res.status(400).json({ error: "Upload failed", details: err.message });
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    
+
     const textContent = req.file.buffer.toString('utf8');
     const safeFolder = path.basename(req.body.path || "");
     const safeFilename = path.basename(req.file.originalname);
     const targetDir = path.join(FILES_DIR, safeFolder);
-    
+
     if (!fs.existsSync(targetDir)) {
       fs.mkdirSync(targetDir, { recursive: true });
     }
@@ -114,15 +169,15 @@ app.post("/upload", (req, res) => {
 
     try {
       fs.writeFileSync(filePath, req.file.buffer);
-      
+
       await pool.query(
         "INSERT INTO doc_extra (doc_extra_id, doc_extra_txt) VALUES ($1, $2)",
         [safeFilename, textContent]
       );
-      
-      res.json({ success: true, message: "Archivo subido correctamente" });
 
+      res.json({ success: true, message: "Archivo subido correctamente" });
     } catch (error) {
+      log('ERROR', 'Error en /upload', { error: error.message });
       res.status(500).json({ error: "Error al insertar en la BD", details: error.message });
     }
   });
@@ -138,16 +193,13 @@ app.post("/clinical-files/upload", (req, res) => {
     const stream = Readable.from(req.file.buffer.toString());
 
     stream
-      .pipe(csv()) 
-      .on('data', (fila) => {
-        fichas.push(fila);
-      })
+      .pipe(csv())
+      .on('data', (fila) => { fichas.push(fila); })
       .on('end', async () => {
-        const client = await pool.connect(); 
+        const client = await pool.connect();
         try {
-          await client.query('BEGIN'); 
+          await client.query('BEGIN');
 
-          // Consulta SQL basada en tu tabla Clinical_File
           const insertQuery = `
             INSERT INTO Clinical_File (doc_id, doc_type, doc_date, title, patient_id, filename, sha256)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -155,93 +207,84 @@ app.post("/clinical-files/upload", (req, res) => {
           `;
 
           let insertados = 0;
-
           for (const f of fichas) {
-            // Asegúrate de que las cabeceras de tu CSV coincidan con estas propiedades (f.doc_id, etc.)
             await client.query(insertQuery, [
-              f.doc_id, 
-              f.doc_type, 
-              f.doc_date, 
-              f.title, 
-              f.patient_id, 
-              f.filename, 
-              f.sha256
+              f.doc_id, f.doc_type, f.doc_date, f.title,
+              f.patient_id, f.filename, f.sha256
             ]);
             insertados++;
           }
 
-          await client.query('COMMIT'); 
+          await client.query('COMMIT');
           res.json({ success: true, message: `Se procesaron ${insertados} fichas clínicas correctamente.` });
-
         } catch (dbError) {
-          await client.query('ROLLBACK'); 
-          console.error("Error en base de datos:", dbError);
+          await client.query('ROLLBACK');
+          log('ERROR', 'Error en /clinical-files/upload', { error: dbError.message });
           res.status(500).json({ error: "Error al guardar en la base de datos", details: dbError.message });
         } finally {
-          client.release(); 
+          client.release();
         }
       });
   });
 });
 
-app.post("/admin/users", isAdmin, async (req, res) => { //Crear usuario -Sofi
+app.post("/admin/users", isAdmin, async (req, res) => {
   const { user_id, username, password, full_name, email, role } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 12);
-    
+
     await pool.query(
       "INSERT INTO users (user_id, username, password, full_name, email, role) VALUES ($1, $2, $3, $4, $5, $6)",
       [user_id, username, hashedPassword, full_name, email, role]
     );
+    log('INFO', 'Usuario creado', { user_id, username, role });
     res.json({ success: true, message: "Usuario creado correctamente" });
   } catch (error) {
+    log('ERROR', 'Error en POST /admin/users', { error: error.message });
     res.status(500).json({ error: "Error al crear usuario", details: error.message });
   }
 });
 
-app.delete("/admin/users/:id", isAdmin, async (req, res) => { //Eliminar usuario -Sof
+app.delete("/admin/users/:id", isAdmin, async (req, res) => {
   const userId = req.params.id;
-  
-  if (req.session.user && req.session.user.user_id === userId) { //Wacho si ves esto deberíamos hacer que el admin se pueda eliminar a si mismo??? -Sofi
+
+  if (req.session.user && req.session.user.user_id === userId) {
     return res.status(400).json({ error: "No puedes eliminar tu propia cuenta." });
   }
 
   try {
     await pool.query("DELETE FROM users WHERE user_id = $1", [userId]);
+    log('INFO', 'Usuario eliminado', { user_id: userId });
     res.json({ success: true, message: "Usuario eliminado correctamente" });
   } catch (error) {
-    res.status(500).json({ 
-      error: "Error al eliminar usuario", 
-      details: error.message 
+    log('ERROR', 'Error en DELETE /admin/users/:id', { error: error.message, user_id: userId });
+    res.status(500).json({
+      error: "Error al eliminar usuario",
+      details: error.message
     });
   }
 });
 
-app.get("/admin/users", isAdmin, async (req, res) => { //Lista de usuarios -Sofi
+app.get("/admin/users", isAdmin, async (req, res) => {
   try {
-    // Consulta para obtener usuarios ordenados por nombre completo
     const result = await pool.query("SELECT user_id, username, full_name, role FROM users ORDER BY full_name ASC");
     res.json({ success: true, users: result.rows });
   } catch (error) {
+    log('ERROR', 'Error en GET /admin/users', { error: error.message });
     res.status(500).json({ error: "Error al obtener la lista de usuarios", details: error.message });
   }
 });
 
-/**
- * 2. Endpoint para listar todas las fichas desde la base de datos
- */
 app.get("/clinical-files", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM Clinical_File ORDER BY doc_date DESC");
     res.json({ success: true, records: result.rows });
   } catch (error) {
+    log('ERROR', 'Error en GET /clinical-files', { error: error.message });
     res.status(500).json({ error: "Error al obtener fichas", details: error.message });
   }
 });
 
-/**
- * 3. Endpoint para obtener una ficha específica por su ID
- */
 app.get("/clinical-files/:id", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM Clinical_File WHERE doc_id = $1", [req.params.id]);
@@ -250,40 +293,33 @@ app.get("/clinical-files/:id", async (req, res) => {
     }
 
     const clinicalFile = result.rows[0];
-
     const filesResult = await pool.query("SELECT doc_extra_txt FROM doc_extra WHERE doc_extra_id = $1", [clinicalFile.filename]);
-
     clinicalFile.observations = filesResult.rows;
 
     res.json({ success: true, record: clinicalFile });
   } catch (error) {
+    log('ERROR', 'Error en GET /clinical-files/:id', { id: req.params.id, error: error.message });
     res.status(500).json({ error: "Error en la base de datos", details: error.message });
   }
 });
 
 
 app.post("/patients/upload", (req, res) => {
-  // Usamos "file" porque es el nombre del campo en el FormData del frontend
   upload.single("file")(req, res, async (err) => {
     if (err) return res.status(400).json({ error: "Upload failed", details: err.message });
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
     const pacientes = [];
-
-    // Convertimos el buffer del archivo en un Stream legible
     const stream = Readable.from(req.file.buffer.toString());
 
     stream
-      .pipe(csv()) // ¡Ojo! Los nombres de las columnas en tu CSV deben coincidir con lo que leas aquí
-      .on('data', (fila) => {
-        pacientes.push(fila);
-      })
+      .pipe(csv())
+      .on('data', (fila) => { pacientes.push(fila); })
       .on('end', async () => {
-        const client = await pool.connect(); // Usamos un cliente dedicado para la transacción
+        const client = await pool.connect();
         try {
-          await client.query('BEGIN'); // Iniciamos transacción
+          await client.query('BEGIN');
 
-          // Consulta SQL basada en tu tabla patients
           const insertQuery = `
             INSERT INTO patients (patient_id, national_id_fake, full_name, sex, birth_date, phone, address, insurance, notes)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -291,33 +327,22 @@ app.post("/patients/upload", (req, res) => {
           `;
 
           let insertados = 0;
-
           for (const p of pacientes) {
-            // Asegúrate de que las propiedades (p.patient_id, etc.) coincidan EXACTAMENTE 
-            // con los encabezados de la primera fila de tu archivo .csv
             await client.query(insertQuery, [
-              p.patient_id, 
-              p.national_id_fake, 
-              p.full_name, 
-              p.sex, 
-              p.birth_date, 
-              p.phone, 
-              p.address, 
-              p.insurance, 
-              p.notes || null // notes permite nulos según tu esquema
+              p.patient_id, p.national_id_fake, p.full_name, p.sex,
+              p.birth_date, p.phone, p.address, p.insurance, p.notes || null
             ]);
             insertados++;
           }
 
-          await client.query('COMMIT'); // Guardamos los cambios
+          await client.query('COMMIT');
           res.json({ success: true, message: `Se procesaron ${insertados} pacientes correctamente.` });
-
         } catch (dbError) {
-          await client.query('ROLLBACK'); // Si algo falla, deshacemos todo
-          console.error("Error en base de datos:", dbError);
+          await client.query('ROLLBACK');
+          log('ERROR', 'Error en /patients/upload', { error: dbError.message });
           res.status(500).json({ error: "Error al guardar en la base de datos", details: dbError.message });
         } finally {
-          client.release(); // Liberamos el cliente
+          client.release();
         }
       });
   });
@@ -326,13 +351,10 @@ app.post("/patients/upload", (req, res) => {
 
 app.get("/patients", async (req, res) => {
   try {
-    // Consultamos todos los pacientes, ordenados alfabéticamente por nombre
     const result = await pool.query("SELECT * FROM patients");
-    
-    // Devolvemos el array de pacientes bajo la propiedad "patients"
     res.json({ success: true, patients: result.rows });
   } catch (error) {
-    console.error("Error al obtener pacientes:", error);
+    log('ERROR', 'Error en GET /patients', { error: error.message });
     res.status(500).json({ error: "Error al obtener pacientes", details: error.message });
   }
 });
@@ -341,38 +363,30 @@ app.get("/patients", async (req, res) => {
 app.get("/patients/:id", async (req, res) => {
   const patientId = req.params.id;
   try {
-    // 1. Buscamos primero al paciente solito
     const patientResult = await pool.query("SELECT * FROM patients WHERE patient_id = $1", [patientId]);
-    
-    // Si no hay filas, el paciente no existe
+
     if (patientResult.rows.length === 0) {
       return res.status(404).json({ success: false, error: "Paciente no encontrado" });
     }
 
-    // Guardamos los datos del paciente en una variable
     const patientData = patientResult.rows[0];
 
-    // 2. Buscamos las fichas clínicas básicas del paciente
     const filesResult = await pool.query("SELECT * FROM Clinical_File WHERE patient_id = $1 ORDER BY doc_date DESC", [patientId]);
     const clinicalFiles = filesResult.rows;
 
-
     for (let file of clinicalFiles) {
       const obsResult = await pool.query("SELECT doc_extra_txt FROM doc_extra WHERE doc_extra_id = $1", [file.filename]);
-      file.observations = obsResult.rows; 
+      file.observations = obsResult.rows;
     }
     patientData.clinical_files = clinicalFiles;
 
     res.json({ success: true, patient: patientData });
-
   } catch (error) {
+    log('ERROR', 'Error en GET /patients/:id', { id: patientId, error: error.message });
     res.status(500).json({ error: "Error en la base de datos", details: error.message });
   }
 });
 
-/**
- * Endpoint para descargar archivos desde el servidor local.
- */
 app.get("/download/:filename", (req, res) => {
   const filePath = path.join(FILES_DIR, req.params.filename);
   if (!fs.existsSync(filePath)) {
@@ -380,26 +394,22 @@ app.get("/download/:filename", (req, res) => {
   }
   res.download(filePath, req.params.filename, (err) => {
     if (err) {
+      log('ERROR', 'Error en GET /download/:filename', { filename: req.params.filename, error: err.message });
       res.status(500).json({ error: "Error downloading file", details: err.message });
     }
   });
 });
 
-/**
- * Endpoint para listar los archivos disponibles en el directorio local.
- */
 app.get("/files", (req, res) => {
   fs.readdir(FILES_DIR, (err, files) => {
     if (err) {
+      log('ERROR', 'Error en GET /files', { error: err.message });
       return res.status(500).json({ error: "Error listing files", details: err.message });
     }
     res.json({ success: true, files });
   });
 });
 
-/**
- * Endpoint de login (POST) para validar credenciales.
- */
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ result: false, error: "Missing data" });
@@ -413,50 +423,52 @@ app.post("/login", async (req, res) => {
 
       if (match) {
         if (user.two_factor_secret) {
-          req.session.tempUser = user.username; 
+          req.session.tempUser = user.username;
+          log('INFO', 'Login exitoso, requiere 2FA', { username });
           return res.json({ result: true, require2FA: true, message: "Por favor ingresa tu código 2FA" });
         } else {
-          req.session.user = { username: user.username, role: user.role }; 
+          req.session.user = { username: user.username, role: user.role };
+          log('INFO', 'Login exitoso', { username, role: user.role });
           return res.json({ result: true, require2FA: false });
         }
       } else {
+        log('WARN', 'Login fallido: contraseña incorrecta', { username });
         return res.json({ result: false, error: "Credenciales inválidas" });
       }
     } else {
+      log('WARN', 'Login fallido: usuario no encontrado', { username });
       return res.json({ result: false, error: "Credenciales inválidas" });
     }
   } catch (error) {
+    log('ERROR', 'Error en POST /login', { error: error.message });
     res.status(500).json({ result: false, error: error.message });
   }
 });
 
-// 2FA
 app.post("/setup-2fa", async (req, res) => {
-  // Asumimos que el usuario ya inició sesión para configurar su 2FA
   if (!req.session.user) {
     return res.status(401).json({ error: "Debes iniciar sesión para configurar 2FA" });
   }
 
   try {
-    // 1. Generamos el secreto único para este usuario
-    const newSecret = twofactor.generateSecret({ 
-      name: 'DocLocker', 
-      account: req.session.user.username 
+    const newSecret = twofactor.generateSecret({
+      name: 'DocLocker',
+      account: req.session.user.username
     });
 
-    // 2. Guardamos el secreto en la base de datos
     await pool.query(
       "UPDATE users SET two_factor_secret = $1 WHERE username = $2",
       [newSecret.secret, req.session.user.username]
     );
 
-    // 3. Devolvemos el QR para que el frontend lo muestre
-    res.json({ 
-      success: true, 
+    log('INFO', '2FA configurado', { username: req.session.user.username });
+    res.json({
+      success: true,
       message: "Escanea el código QR en tu app de autenticación",
-      qr_url: newSecret.qr // Url de un código QR listo para usar
+      qr_url: newSecret.qr
     });
   } catch (error) {
+    log('ERROR', 'Error en POST /setup-2fa', { error: error.message });
     res.status(500).json({ error: "Error configurando 2FA", details: error.message });
   }
 });
@@ -464,38 +476,35 @@ app.post("/setup-2fa", async (req, res) => {
 
 app.post("/verify-2fa", async (req, res) => {
   const { token } = req.body;
-  const username = req.session.tempUser; // Rescatamos al usuario de la sala de espera
+  const username = req.session.tempUser;
 
   if (!username) {
     return res.status(400).json({ result: false, error: "No hay un inicio de sesión pendiente" });
   }
 
   try {
-    // Buscamos el secreto del usuario en la base de datos
     const result = await pool.query("SELECT * FROM users WHERE username = $1", [username]);
     const user = result.rows[0];
 
-    // Verificamos el código (node-2fa devuelve null si es inválido)
     const isValid = twofactor.verifyToken(user.two_factor_secret, token);
 
     if (isValid != null) {
-      // ¡Código válido! Le damos acceso total y limpiamos la sala de espera
       req.session.user = { username: user.username, role: user.role };
       delete req.session.tempUser;
+      log('INFO', '2FA verificado exitosamente', { username });
       return res.json({ result: true, message: "Inicio de sesión exitoso" });
     } else {
+      log('WARN', '2FA fallido: código incorrecto', { username });
       return res.status(401).json({ result: false, error: "Código 2FA incorrecto" });
     }
   } catch (error) {
+    log('ERROR', 'Error en POST /verify-2fa', { error: error.message });
     res.status(500).json({ result: false, error: error.message });
   }
 });
 
 
 app.get("/login", (req, res) => {
-  // Asumiendo que el archivo se llama "login.html.ejs" en ./views.
-  // Si se usa res.render('login') y el motor de vistas es ejs, por defecto se buscará "login.ejs".
-  // Si deseas mantener la extensión "html.ejs", puedes invocar res.render('login.html').
   res.render("login", { title: "DocLocker Login" });
 });
 
@@ -503,13 +512,15 @@ app.get("/", (req, res) => {
   res.redirect("/login");
 });
 
-app.get("/logout", (req, res) => { //si funciona para login supongo que funcionará para logout - Sofi
+app.get("/logout", (req, res) => {
+  const username = req.session.user?.username;
   req.session.destroy(() => {
-    res.redirect("/login"); //Wacho me dijiste que redireccionara a login de vuelta si hacen logout lo dejo? -Sofi
+    log('INFO', 'Sesión cerrada', { username });
+    res.redirect("/login");
   });
 });
 
-app.get("/api/me", (req, res) => { //Esta cuestion es para que solo los admins vean el panel -Sofi
+app.get("/api/me", (req, res) => {
   if (req.session.user) {
     res.json({ success: true, user: req.session.user });
   } else {
@@ -517,31 +528,20 @@ app.get("/api/me", (req, res) => { //Esta cuestion es para que solo los admins v
   }
 });
 
-/**
- * Nuevo endpoint GET /home para renderizar la vista de pruebas de la API.
- */
 app.get("/home", (req, res) => {
-  if (!req.session.user) { //proteger home para que no se metan por el url (puro cine la verdad) -Sofi
+  if (!req.session.user) {
     return res.redirect("/login");
   }
-
-  // Asumiendo que el archivo se llama "home.html.ejs" en ./views.
   res.render("home", { title: "DocLocker" });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// === Servidor ===
 
+const PORT = process.env.PORT || 3000;
 
 const HOP_BY_HOP_HEADERS = new Set([
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
+  "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+  "te", "trailer", "transfer-encoding", "upgrade",
 ]);
 
 function proxyHttp2StreamToExpress(stream, headers, expressPort) {
@@ -560,10 +560,9 @@ function proxyHttp2StreamToExpress(stream, headers, expressPort) {
     method: headers[":method"],
     path: headers[":path"],
     headers: requestHeaders,
+    timeout: 30000,
   }, (proxyRes) => {
-    const responseHeaders = {
-      ":status": proxyRes.statusCode,
-    };
+    const responseHeaders = { ":status": proxyRes.statusCode };
 
     for (const [name, value] of Object.entries(proxyRes.headers)) {
       if (HOP_BY_HOP_HEADERS.has(name)) continue;
@@ -574,34 +573,52 @@ function proxyHttp2StreamToExpress(stream, headers, expressPort) {
     proxyRes.pipe(stream);
   });
 
+  proxyReq.on("timeout", () => {
+    log('ERROR', 'Timeout proxying HTTP/2 request to Express', {
+      method: headers[":method"],
+      path: headers[":path"],
+    });
+    proxyReq.destroy();
+    if (!stream.destroyed) {
+      stream.respond({ ":status": 504 });
+      stream.end("Gateway Timeout");
+    }
+  });
+
   proxyReq.on("error", (err) => {
-    console.error("Error proxying HTTP/2 request to Express:", err);
+    log('ERROR', 'Error proxying HTTP/2 request to Express', {
+      error: err.message,
+      method: headers[":method"],
+      path: headers[":path"],
+    });
     if (!stream.destroyed) {
       stream.respond({ ":status": 502 });
       stream.end("Bad Gateway");
     }
   });
 
-  stream.on("error", () => {
-    proxyReq.destroy();
-  });
-
+  stream.on("error", () => { proxyReq.destroy(); });
   stream.pipe(proxyReq);
 }
 
 if (ENV === 'production' && !process.env.SESSIONS_SECRET) {
-  console.error("SESSIONS_SECRET debe estar configurado en producción.");
+  log('FATAL', 'SESSIONS_SECRET debe estar configurado en producción');
   process.exit(1);
 }
 
 if (ENV === 'production') {
-  // Ojo, modificar los archivos del certificado y referenciar los
-  // que han recibido por correo electrónico
-  const certPath = process.env.SSL_CERT_PATH || '/app/certs/4104.grupotest.crt';
-  const keyPath = process.env.SSL_KEY_PATH || '/app/certs/4104.grupotest.key';
+  const certPath = process.env.SSL_CERT_PATH || 'certs/4104.grupo12.crt';
+  // SSL_KEY_PATH tiene prioridad; si no está, usa CERTIFICATE_PRIVATE_KEY_PATH (path donde entrypoint.sh escribe la clave)
+  const keyPath = process.env.SSL_KEY_PATH || process.env.CERTIFICATE_PRIVATE_KEY_PATH || 'certs/4104.grupo12.key';
 
-  if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
-    console.error("Certificado o clave no encontrada en el contenedor.");
+  log('INFO', 'Iniciando servidor en modo producción', { certPath, keyPath, port: PORT });
+
+  if (!fs.existsSync(certPath)) {
+    log('FATAL', 'Certificado SSL no encontrado', { certPath });
+    process.exit(1);
+  }
+  if (!fs.existsSync(keyPath)) {
+    log('FATAL', 'Clave privada SSL no encontrada', { keyPath });
     process.exit(1);
   }
 
@@ -612,10 +629,17 @@ if (ENV === 'production') {
       allowHTTP1: true,
     };
 
+    // Servidor HTTP interno al que http2Server hace proxy para requests HTTP/2
     const expressServer = http.createServer(app);
     expressServer.listen(0, "127.0.0.1", () => {
       const expressPort = expressServer.address().port;
+      log('INFO', 'Servidor Express interno escuchando', { port: expressPort });
+
       const http2Server = http2.createSecureServer(options);
+
+      http2Server.on("error", (err) => {
+        log('ERROR', 'Error en el servidor HTTP/2', { error: err.message });
+      });
 
       http2Server.on("request", (req, res) => {
         if (req.httpVersionMajor === 1) {
@@ -628,18 +652,19 @@ if (ENV === 'production') {
       });
 
       http2Server.listen(PORT, () => {
-        console.log(`HTTP/2 server running in ${ENV} mode on port ${PORT}`);
+        log('INFO', `Servidor HTTP/2 iniciado en modo ${ENV}`, { port: PORT });
       });
     });
-    
+
   } catch (err) {
-    console.error('Failed to start HTTPS server: could not load key/cert files');
-    console.error(err);
+    log('FATAL', 'No se pudo iniciar el servidor HTTPS', { error: err.message, stack: err.stack });
     process.exit(1);
   }
 
 } else {
+  // BUG CORREGIDO: app.listen() fue eliminado de aquí (estaba duplicado e incondicional).
+  // Solo este bloque debe levantar el servidor en desarrollo.
   http.createServer(app).listen(PORT, () => {
-    console.log(`HTTP server running in ${ENV} mode on port ${PORT}`);
+    log('INFO', `Servidor HTTP iniciado en modo ${ENV}`, { port: PORT });
   });
 }

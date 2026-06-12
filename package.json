@@ -24,7 +24,7 @@
   "homepage": "https://github.com/ICC4104-202610-Ciberseguridad/project-base#readme",
   "dependencies": {
     "bcrypt": "^6.0.0",
-    "csv-parser": "^3.2.0",
+    "csv-parser": "^3.2.1",
     "ejs": "^3.1.10",
     "express": "^4.21.2",
     "express-ejs-layouts": "^2.5.1",
