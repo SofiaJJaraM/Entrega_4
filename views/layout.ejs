@@ -22,7 +22,7 @@
                 <a class="nav-link" href="/">Inicio</a>
               </li>
 
-              <% if (!locals.user) { %> <!--con esto debería funcionar la cuestion que hice en server.js (todo esto es teorico Wacho no me acuerda de ni una $#%)-->
+              <% if (!locals.user) { %>
                 <li class="nav-item">
                   <a class="nav-link" href="/login">Login</a>
                 </li>
@@ -30,6 +30,18 @@
                 <li class="nav-item">
                   <span class="nav-link">Bienvenido, <%= locals.user.username %></span>
                 </li>
+
+                <!-- Control de acceso en la vista (RBAC con CASL):
+                     `ability` está disponible en todas las vistas vía
+                     res.locals.ability (ver middleware/access.js -> attachAbility).
+                     El enlace de administración de usuarios solo se muestra
+                     si el rol del usuario tiene permiso 'manage' sobre 'User'. -->
+                <% if (locals.ability && ability.can('manage', 'User')) { %>
+                  <li class="nav-item">
+                    <a class="nav-link" href="/admin/users">Administración</a>
+                  </li>
+                <% } %>
+
                 <li class="nav-item">
                   <a class="nav-link" href="/logout">Logout</a>
                 </li>

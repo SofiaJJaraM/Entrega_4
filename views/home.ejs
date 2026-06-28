@@ -1,4 +1,6 @@
-<div id="app"></div>
+<div id="app"
+     data-can-manage-users="<%= (locals.ability && ability.can('manage', 'User')) ? 'true' : 'false' %>">
+</div>
 
 <script>
   // Esperamos a que el DOM esté completamente cargado
@@ -8,12 +10,18 @@
     const { html, render } = window.litHtml;
     const appContainer = document.getElementById('app');
 
+    // Control de acceso en la vista (RBAC con CASL): el servidor calcula
+    // `ability.can('manage', 'User')` según el rol de la sesión y lo expone
+    // en un data-attribute. Esto evita confiar únicamente en comparar el
+    // string de rol en el cliente; la autorización real de todas formas
+    // se vuelve a verificar en cada endpoint del servidor (req.ability).
+    const canManageUsers = appContainer.dataset.canManageUsers === 'true';
+
     // Estado de la aplicación: centralizamos todas las variables
     const state = {
       //Usuarios
       currentUser: null,
       usersList: [],
-      currentUser: null,
 
       // Fichas (Archivos Físicos)
       uploadMessage: '',
@@ -197,7 +205,7 @@
           </div> 
 
           <div class="container pb-5">
-            ${state.currentUser && state.currentUser.role === 'admin' 
+            ${canManageUsers
               ? html`
                 <div class="row mt-5"> 
                   <div class="col-12">
@@ -266,7 +274,7 @@
         const response = await axios.get('/api/me');
         if (response.data.success) {
           state.currentUser = response.data.user;
-          if (state.currentUser.role === 'admin') {
+          if (canManageUsers) {
             listAllUsers();
           }
         } else {

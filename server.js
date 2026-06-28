@@ -15,16 +15,36 @@ const twofactor = require('node-2fa');
 const session = require("express-session");
 const FileStore = require("session-file-store")(session);
 
+// Validación / sanitización de entradas (XSS, NoSQL/command injection, etc.)
+const { body, param, validationResult } = require('express-validator');
+
+// Logging auditable (winston) — ver logger.js
+const { logger } = require('./logger');
+
+// Control de acceso RBAC (CASL) y mitigación de IDOR — ver abilities.js y middleware/
+const { attachAbility, requireAuth, isAdmin } = require('./middleware/access');
+const { auditAccess } = require('./middleware/audit');
+
 // === Logging ===
-const LOG_DIR = path.join(__dirname, 'logs');
-const LOG_FILE = path.join(LOG_DIR, 'app.log');
-
-if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
-
+// Mantenemos esta función `log` como alias delgado sobre winston para no
+// tener que reescribir cada llamada existente en este archivo; internamente
+// ya escribe a consola y a logs/app.log mediante winston (ver logger.js).
 function log(level, msg, meta = {}) {
-  const entry = JSON.stringify({ ts: new Date().toISOString(), level, msg, ...meta });
-  process.stdout.write(entry + '\n');
-  try { fs.appendFileSync(LOG_FILE, entry + '\n'); } catch (_) {}
+  const winstonLevel = { FATAL: 'error', ERROR: 'error', WARN: 'warn', INFO: 'info', REQUEST: 'info' }[level] || 'info';
+  logger.log(winstonLevel, msg, { level, ...meta });
+}
+
+/**
+ * Middleware de manejo de errores de validación (express-validator).
+ * Se coloca después de las reglas `body(...)`/`param(...)` en cada ruta.
+ */
+function handleValidationErrors(req, res, next) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    log('WARN', 'Validación de entrada fallida', { url: req.originalUrl, errors: errors.array() });
+    return res.status(400).json({ success: false, error: 'Datos de entrada inválidos', details: errors.array() });
+  }
+  next();
 }
 
 // Capturar errores no manejados antes de que crasheen el proceso
@@ -80,6 +100,11 @@ app.use((req, res, next) => {
   res.locals.user = req.session.user || null;
   next();
 });
+
+// Control de acceso RBAC: adjunta req.ability y res.locals.ability
+// (este último para poder usar `ability.can(...)` directamente en las vistas EJS)
+// según el rol del usuario en sesión. Ver abilities.js.
+app.use(attachAbility);
 
 // Directorio local para almacenar archivos
 const FILES_DIR = path.join(__dirname, "files");
@@ -137,22 +162,20 @@ pool.query('SELECT 1').then(() => {
   log('ERROR', 'No se pudo conectar a PostgreSQL al arrancar', { error: err.message });
 });
 
-const isAdmin = (req, res, next) => {
-  if (req.session.user && req.session.user.role === 'admin') {
-    return next();
-  }
-  log('WARN', 'Acceso denegado: se requiere rol admin', {
-    url: req.url,
-    user: req.session.user?.username || 'anónimo',
-  });
-  res.status(403).json({ error: "Acceso denegado. Se requiere rol de administrador." });
-};
+// Nota: el middleware `isAdmin` ya no se define aquí; se importa desde
+// ./middleware/access.js, donde delega la decisión en req.ability (CASL)
+// en lugar de comparar el string de rol directamente. Esto centraliza
+// todas las reglas de autorización en abilities.js (RBAC con CASL).
 
 
 /**
  * Endpoint para subir archivos al servidor local.
+ * Protegido: requiere sesión y permiso CASL `create` sobre 'PhysicalFile'.
  */
-app.post("/upload", (req, res) => {
+app.post("/upload", auditAccess('create', 'PhysicalFile'), requireAuth, (req, res) => {
+  if (req.ability.cannot('create', 'PhysicalFile')) {
+    return res.status(403).json({ error: "Acceso denegado. No tienes permisos para subir archivos." });
+  }
   upload.single("file")(req, res, async (err) => {
     if (err) return res.status(400).json({ error: "Upload failed", details: err.message });
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
@@ -184,7 +207,10 @@ app.post("/upload", (req, res) => {
 });
 
 
-app.post("/clinical-files/upload", (req, res) => {
+app.post("/clinical-files/upload", auditAccess('create', 'ClinicalFile'), requireAuth, (req, res) => {
+  if (req.ability.cannot('create', 'ClinicalFile')) {
+    return res.status(403).json({ error: "Acceso denegado. No tienes permisos para cargar fichas clínicas." });
+  }
   upload.single("file")(req, res, async (err) => {
     if (err) return res.status(400).json({ error: "Upload failed", details: err.message });
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
@@ -228,11 +254,20 @@ app.post("/clinical-files/upload", (req, res) => {
   });
 });
 
-app.post("/admin/users", isAdmin, async (req, res) => {
+app.post("/admin/users", auditAccess('create', 'User', () => 'new'), isAdmin, [
+  body('user_id').trim().escape().notEmpty().withMessage('user_id es requerido'),
+  body('username').trim().escape().notEmpty().withMessage('username es requerido'),
+  body('password').isStrongPassword().withMessage('La contraseña no cumple los requisitos de seguridad'),
+  body('full_name').trim().escape().notEmpty().withMessage('full_name es requerido'),
+  body('email').isEmail().normalizeEmail().withMessage('email inválido'),
+  body('role').trim().escape().isIn(['admin', 'staff', 'doctor', 'nurse']).withMessage('role inválido'),
+], handleValidationErrors, async (req, res) => {
   const { user_id, username, password, full_name, email, role } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 12);
 
+    // Consulta parametrizada: los valores se pasan como arreglo aparte,
+    // nunca interpolados directamente en el string SQL (previene SQL Injection).
     await pool.query(
       "INSERT INTO users (user_id, username, password, full_name, email, role) VALUES ($1, $2, $3, $4, $5, $6)",
       [user_id, username, hashedPassword, full_name, email, role]
@@ -245,14 +280,25 @@ app.post("/admin/users", isAdmin, async (req, res) => {
   }
 });
 
-app.delete("/admin/users/:id", isAdmin, async (req, res) => {
+app.delete("/admin/users/:id", auditAccess('delete', 'User'), isAdmin, [
+  param('id').trim().escape().notEmpty(),
+], handleValidationErrors, async (req, res) => {
   const userId = req.params.id;
 
+  // Mitigación de IDOR / regla de negocio: un admin no puede eliminarse a sí mismo,
+  // incluso teniendo permisos de gestión total.
   if (req.session.user && req.session.user.user_id === userId) {
     return res.status(400).json({ error: "No puedes eliminar tu propia cuenta." });
   }
 
   try {
+    // Verificamos que el recurso exista antes de actuar, y diferenciamos
+    // "no encontrado" de "eliminado", para no dar pistas innecesarias.
+    const existing = await pool.query("SELECT user_id FROM users WHERE user_id = $1", [userId]);
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: "Usuario no encontrado" });
+    }
+
     await pool.query("DELETE FROM users WHERE user_id = $1", [userId]);
     log('INFO', 'Usuario eliminado', { user_id: userId });
     res.json({ success: true, message: "Usuario eliminado correctamente" });
@@ -265,7 +311,7 @@ app.delete("/admin/users/:id", isAdmin, async (req, res) => {
   }
 });
 
-app.get("/admin/users", isAdmin, async (req, res) => {
+app.get("/admin/users", auditAccess('read', 'User', () => 'list'), isAdmin, async (req, res) => {
   try {
     const result = await pool.query("SELECT user_id, username, full_name, role FROM users ORDER BY full_name ASC");
     res.json({ success: true, users: result.rows });
@@ -275,7 +321,10 @@ app.get("/admin/users", isAdmin, async (req, res) => {
   }
 });
 
-app.get("/clinical-files", async (req, res) => {
+app.get("/clinical-files", auditAccess('read', 'ClinicalFile', () => 'list'), requireAuth, async (req, res) => {
+  if (req.ability.cannot('read', 'ClinicalFile')) {
+    return res.status(403).json({ error: "Acceso denegado." });
+  }
   try {
     const result = await pool.query("SELECT * FROM Clinical_File ORDER BY doc_date DESC");
     res.json({ success: true, records: result.rows });
@@ -285,7 +334,15 @@ app.get("/clinical-files", async (req, res) => {
   }
 });
 
-app.get("/clinical-files/:id", async (req, res) => {
+app.get("/clinical-files/:id", auditAccess('read', 'ClinicalFile'), requireAuth, [
+  param('id').trim().escape().notEmpty(),
+], handleValidationErrors, async (req, res) => {
+  // Mitigación de IDOR: aunque el ID venga directo en la URL, primero
+  // verificamos autenticación (arriba) y permiso RBAC (abajo) antes de
+  // exponer cualquier dato del recurso solicitado.
+  if (req.ability.cannot('read', 'ClinicalFile')) {
+    return res.status(403).json({ error: "Acceso denegado." });
+  }
   try {
     const result = await pool.query("SELECT * FROM Clinical_File WHERE doc_id = $1", [req.params.id]);
     if (result.rows.length === 0) {
@@ -304,7 +361,10 @@ app.get("/clinical-files/:id", async (req, res) => {
 });
 
 
-app.post("/patients/upload", (req, res) => {
+app.post("/patients/upload", auditAccess('create', 'Patient', () => 'bulk'), requireAuth, (req, res) => {
+  if (req.ability.cannot('create', 'Patient') && req.ability.cannot('manage', 'all')) {
+    return res.status(403).json({ error: "Acceso denegado. No tienes permisos para cargar pacientes." });
+  }
   upload.single("file")(req, res, async (err) => {
     if (err) return res.status(400).json({ error: "Upload failed", details: err.message });
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
@@ -349,7 +409,10 @@ app.post("/patients/upload", (req, res) => {
 });
 
 
-app.get("/patients", async (req, res) => {
+app.get("/patients", auditAccess('read', 'Patient', () => 'list'), requireAuth, async (req, res) => {
+  if (req.ability.cannot('read', 'Patient')) {
+    return res.status(403).json({ error: "Acceso denegado." });
+  }
   try {
     const result = await pool.query("SELECT * FROM patients");
     res.json({ success: true, patients: result.rows });
@@ -360,7 +423,16 @@ app.get("/patients", async (req, res) => {
 });
 
 
-app.get("/patients/:id", async (req, res) => {
+app.get("/patients/:id", auditAccess('read', 'Patient'), requireAuth, [
+  param('id').trim().escape().notEmpty(),
+], handleValidationErrors, async (req, res) => {
+  // Mitigación de IDOR: el ID de paciente viene directo en la URL
+  // (ej. GET /patients/P0001 -> P0002), por lo que SIEMPRE se verifica
+  // autenticación + autorización RBAC antes de devolver cualquier dato,
+  // independientemente de si el recurso existe o no.
+  if (req.ability.cannot('read', 'Patient')) {
+    return res.status(403).json({ error: "Acceso denegado." });
+  }
   const patientId = req.params.id;
   try {
     const patientResult = await pool.query("SELECT * FROM patients WHERE patient_id = $1", [patientId]);
@@ -387,20 +459,34 @@ app.get("/patients/:id", async (req, res) => {
   }
 });
 
-app.get("/download/:filename", (req, res) => {
-  const filePath = path.join(FILES_DIR, req.params.filename);
+app.get("/download/:filename", auditAccess('read', 'PhysicalFile', (req) => req.params.filename), requireAuth, [
+  param('filename').trim().notEmpty(),
+], handleValidationErrors, (req, res) => {
+  if (req.ability.cannot('read', 'PhysicalFile')) {
+    return res.status(403).json({ error: "Acceso denegado." });
+  }
+
+  // Sanitización de entrada: path.basename() elimina cualquier componente
+  // de ruta (../, /, etc.), evitando un path traversal a través del
+  // parámetro filename (p.ej. "../../etc/passwd").
+  const safeFilename = path.basename(req.params.filename);
+  const filePath = path.join(FILES_DIR, safeFilename);
+
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ error: "File not found" });
   }
-  res.download(filePath, req.params.filename, (err) => {
+  res.download(filePath, safeFilename, (err) => {
     if (err) {
-      log('ERROR', 'Error en GET /download/:filename', { filename: req.params.filename, error: err.message });
+      log('ERROR', 'Error en GET /download/:filename', { filename: safeFilename, error: err.message });
       res.status(500).json({ error: "Error downloading file", details: err.message });
     }
   });
 });
 
-app.get("/files", (req, res) => {
+app.get("/files", auditAccess('read', 'PhysicalFile', () => 'list'), requireAuth, (req, res) => {
+  if (req.ability.cannot('read', 'PhysicalFile')) {
+    return res.status(403).json({ error: "Acceso denegado." });
+  }
   fs.readdir(FILES_DIR, (err, files) => {
     if (err) {
       log('ERROR', 'Error en GET /files', { error: err.message });
@@ -410,11 +496,20 @@ app.get("/files", (req, res) => {
   });
 });
 
-app.post("/login", async (req, res) => {
+app.post("/login", [
+  // Sanitización de entradas: trim + escape neutraliza caracteres peligrosos
+  // (<, >, etc.) para mitigar XSS si el username se llegara a reflejar en
+  // alguna vista; la autenticación en sí sigue siendo vía consulta
+  // parametrizada + bcrypt.compare, nunca por comparación de strings crudos.
+  body('username').trim().escape().notEmpty().withMessage('username es requerido'),
+  body('password').notEmpty().withMessage('password es requerido'),
+], handleValidationErrors, async (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ result: false, error: "Missing data" });
 
   try {
+    // Consulta parametrizada ($1): el valor de username jamás se concatena
+    // directamente en el SQL, por lo que un input como ' OR '1'='1 se trata
+    // como un literal de texto y no como código SQL (previene SQL Injection).
     const result = await pool.query("SELECT * FROM users WHERE username = $1", [username]);
 
     if (result.rows.length > 0) {
@@ -427,7 +522,7 @@ app.post("/login", async (req, res) => {
           log('INFO', 'Login exitoso, requiere 2FA', { username });
           return res.json({ result: true, require2FA: true, message: "Por favor ingresa tu código 2FA" });
         } else {
-          req.session.user = { username: user.username, role: user.role };
+          req.session.user = { user_id: user.user_id, username: user.username, role: user.role };
           log('INFO', 'Login exitoso', { username, role: user.role });
           return res.json({ result: true, require2FA: false });
         }
@@ -445,11 +540,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-app.post("/setup-2fa", async (req, res) => {
-  if (!req.session.user) {
-    return res.status(401).json({ error: "Debes iniciar sesión para configurar 2FA" });
-  }
-
+app.post("/setup-2fa", requireAuth, async (req, res) => {
   try {
     const newSecret = twofactor.generateSecret({
       name: 'DocLocker',
@@ -474,7 +565,9 @@ app.post("/setup-2fa", async (req, res) => {
 });
 
 
-app.post("/verify-2fa", async (req, res) => {
+app.post("/verify-2fa", [
+  body('token').trim().escape().notEmpty().withMessage('token es requerido'),
+], handleValidationErrors, async (req, res) => {
   const { token } = req.body;
   const username = req.session.tempUser;
 
@@ -489,7 +582,7 @@ app.post("/verify-2fa", async (req, res) => {
     const isValid = twofactor.verifyToken(user.two_factor_secret, token);
 
     if (isValid != null) {
-      req.session.user = { username: user.username, role: user.role };
+      req.session.user = { user_id: user.user_id, username: user.username, role: user.role };
       delete req.session.tempUser;
       log('INFO', '2FA verificado exitosamente', { username });
       return res.json({ result: true, message: "Inicio de sesión exitoso" });
@@ -668,3 +761,4 @@ if (ENV === 'production') {
     log('INFO', `Servidor HTTP iniciado en modo ${ENV}`, { port: PORT });
   });
 }
+
